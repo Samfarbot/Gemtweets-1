@@ -1,11 +1,10 @@
 // TweetPulse — server.js
 // Monitors @GemisAlpha → sends all tweets + RTs to @gemtweets
-// Deploy on Render (free tier) — self-pings to stay alive 24/7
+// 30-second polling, 3-minute keepalive
 
 const express = require('express');
 const axios   = require('axios');
 const cheerio = require('cheerio');
-const cron    = require('node-cron');
 const cors    = require('cors');
 
 const app = express();
@@ -16,16 +15,14 @@ app.use(express.json());
 const BOT_TOKEN  = '8725848636:AAGO7T0VBVSZXdHOaWexAJMsMWcYxbg170U';
 const CHAT_ID    = '@gemtweets';
 const HANDLE     = 'GemisAlpha';
-const POLL_EVERY = 2; // minutes
 
-// Render sets this automatically — used for self-ping keepalive
-const SELF_URL = process.env.RENDER_EXTERNAL_URL || '';
+// FIX: hardcoded as fallback since RENDER_EXTERNAL_URL is only on paid plans
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || 'https://gemtweets.onrender.com';
 
-// Nitter fallback chain
 const NITTER_HOSTS = [
+  'https://nitter.net',
   'https://nitter.poast.org',
   'https://nitter.privacydev.net',
-  'https://nitter.net',
   'https://nitter.1d4.us',
 ];
 
@@ -33,6 +30,7 @@ const NITTER_HOSTS = [
 let lastTweetId = null;
 let isFirstRun  = true;
 let pollErrors  = 0;
+let isPolling   = false;
 const logs      = [];
 
 function addLog(level, msg) {
@@ -57,7 +55,6 @@ async function getLatestTweets() {
         }
       });
 
-      // Make sure we got actual RSS, not an error page
       if (!data || !data.includes('<item>')) {
         addLog('warn', `${host} returned invalid RSS — skipping`);
         continue;
@@ -123,7 +120,6 @@ function buildMessage(tweet) {
   const icon    = isRT ? '🔁' : isReply ? '💬' : '🐦';
   const type    = isRT ? 'Retweeted' : isReply ? 'Replied' : 'New Tweet';
 
-  // Convert any nitter link → x.com
   const twitterLink = tweet.link.replace(/https?:\/\/nitter\.[^/]+\//, 'https://x.com/');
 
   return (
@@ -136,57 +132,72 @@ function buildMessage(tweet) {
 
 // ─── MAIN POLL ─────────────────────────────────────────────
 async function poll() {
-  addLog('info', `Polling @${HANDLE}...`);
-  const tweets = await getLatestTweets();
-  if (!tweets.length) return;
+  if (isPolling) {
+    addLog('info', 'Poll skipped — previous poll still running');
+    return;
+  }
 
-  const latest = tweets[0];
+  isPolling = true;
 
-  // First run: set baseline silently — don't spam old tweets
-  if (isFirstRun) {
+  try {
+    addLog('info', `Polling @${HANDLE}...`);
+    const tweets = await getLatestTweets();
+    if (!tweets.length) return;
+
+    const latest = tweets[0];
+
+    // First run: set baseline, don't notify
+    if (isFirstRun) {
+      lastTweetId = latest.guid;
+      isFirstRun  = false;
+      addLog('info', `✅ Baseline set — watching @${HANDLE} from now`);
+      return;
+    }
+
+    // Nothing new
+    if (lastTweetId === latest.guid) {
+      addLog('info', `@${HANDLE} — no new tweets`);
+      return;
+    }
+
+    // Collect new tweets since last seen
+    const newTweets = [];
+    for (const tweet of tweets) {
+      if (tweet.guid === lastTweetId) break;
+      newTweets.push(tweet);
+    }
+
+    // FIX: update lastTweetId BEFORE sending so a Telegram crash can't cause duplicates
     lastTweetId = latest.guid;
-    isFirstRun  = false;
-    addLog('info', `✅ Baseline set — watching @${HANDLE} from now`);
-    return;
-  }
 
-  // Nothing new
-  if (lastTweetId === latest.guid) {
-    addLog('info', `@${HANDLE} — no new tweets`);
-    return;
-  }
+    // FIX: reverse first (oldest → newest), THEN cap at 5 to avoid wrong-order splice
+    newTweets.reverse();
+    if (newTweets.length > 5) {
+      addLog('warn', `${newTweets.length} new tweets — capping at 5 to avoid spam`);
+      newTweets.splice(0, newTweets.length - 5); // keep the 5 most recent
+    }
 
-  // Collect all new tweets since last seen
-  const newTweets = [];
-  for (const tweet of tweets) {
-    if (tweet.guid === lastTweetId) break;
-    newTweets.push(tweet);
-  }
+    for (const tweet of newTweets) {
+      await sendTelegram(buildMessage(tweet));
+      await new Promise(r => setTimeout(r, 1500));
+    }
 
-  // If the full list is new (e.g. bot was offline for a while), cap at 5 to avoid spam
-  if (newTweets.length === tweets.length) {
-    addLog('warn', 'Many new tweets detected — capping at 5 to avoid spam');
-    newTweets.splice(5);
-  }
+    addLog('success', `Notified: ${newTweets.length} new tweet(s) from @${HANDLE}`);
 
-  // Send oldest first (chronological)
-  for (const tweet of newTweets.reverse()) {
-    await sendTelegram(buildMessage(tweet));
-    await new Promise(r => setTimeout(r, 1500));
+  } finally {
+    // Always release the lock, even on error
+    isPolling = false;
   }
-
-  lastTweetId = latest.guid;
-  addLog('success', `Notified: ${newTweets.length} new tweet(s) from @${HANDLE}`);
 }
 
 // ─── SAFE POLL WRAPPER ─────────────────────────────────────
-// Catches any crash so cron never silently dies
 async function safePoll() {
   try {
     await poll();
     pollErrors = 0;
   } catch (err) {
     pollErrors++;
+    isPolling = false; // safety reset in case finally didn't fire
     addLog('error', `Unhandled poll error #${pollErrors}: ${err.message}`);
     if (pollErrors === 5) {
       await sendTelegram('⚠️ <b>TweetPulse</b>: 5 consecutive errors. Still running — check /logs.').catch(() => {});
@@ -194,14 +205,8 @@ async function safePoll() {
   }
 }
 
-// ─── SELF-PING KEEPALIVE ───────────────────────────────────
-// Prevents Render free tier from sleeping (spins down after 15min idle)
+// ─── SELF-PING KEEPALIVE (every 3 minutes) ─────────────────
 function startKeepalive() {
-  if (!SELF_URL) {
-    addLog('warn', 'RENDER_EXTERNAL_URL not found — keepalive inactive. Render should set this automatically.');
-    return;
-  }
-
   setInterval(async () => {
     try {
       await axios.get(`${SELF_URL}/health`, { timeout: 8000 });
@@ -209,14 +214,14 @@ function startKeepalive() {
     } catch (err) {
       addLog('warn', `Keepalive ping failed: ${err.message}`);
     }
-  }, 10 * 60 * 1000); // every 10 minutes
+  }, 3 * 60 * 1000);
 
-  addLog('info', `🏓 Keepalive active — pinging ${SELF_URL}/health every 10min`);
+  addLog('info', `🏓 Keepalive active — pinging ${SELF_URL}/health every 3min`);
 }
 
-// ─── CRON ──────────────────────────────────────────────────
-cron.schedule(`*/${POLL_EVERY} * * * *`, safePoll);
-addLog('info', `⏱ Cron: polling every ${POLL_EVERY} minutes`);
+// ─── 30-SECOND POLL INTERVAL ───────────────────────────────
+setInterval(safePoll, 30 * 1000);
+addLog('info', '⏱ Poll interval: every 30 seconds');
 
 // ─── ROUTES ────────────────────────────────────────────────
 app.get('/', (req, res) => {
@@ -224,7 +229,8 @@ app.get('/', (req, res) => {
     status     : 'running ✅',
     watching   : `@${HANDLE}`,
     notifying  : CHAT_ID,
-    pollEvery  : `${POLL_EVERY} min`,
+    pollEvery  : '30 seconds',
+    keepalive  : '3 minutes',
     lastTweetId,
     pollErrors,
     uptime     : `${Math.floor(process.uptime() / 60)} min`,
@@ -232,22 +238,16 @@ app.get('/', (req, res) => {
   });
 });
 
-app.get('/health', (req, res) => {
-  res.json({ ok: true, uptime: process.uptime() });
-});
+app.get('/health', (req, res) => res.json({ ok: true, uptime: process.uptime() }));
+app.get('/logs',   (req, res) => res.json(logs));
 
-app.get('/logs', (req, res) => {
-  res.json(logs);
-});
-
-// Manually trigger a poll (useful for testing)
 app.post('/force-poll', async (req, res) => {
   addLog('info', 'Force poll triggered via /force-poll');
   await safePoll();
   res.json({ ok: true });
 });
 
-// ─── START SERVER ──────────────────────────────────────────
+// ─── START ─────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
@@ -257,16 +257,15 @@ app.listen(PORT, () => {
   // First poll 5s after boot
   setTimeout(safePoll, 5000);
 
-  // Start keepalive after 15s (give server time to settle)
+  // Start keepalive after 15s
   setTimeout(startKeepalive, 15000);
 });
 
-// ─── PREVENT CRASHES FROM KILLING THE PROCESS ──────────────
+// ─── GLOBAL CRASH GUARD ────────────────────────────────────
 process.on('unhandledRejection', (reason) => {
   addLog('error', `Unhandled rejection: ${reason}`);
 });
 
 process.on('uncaughtException', (err) => {
   addLog('error', `Uncaught exception: ${err.message} — continuing`);
-  // intentionally NOT calling process.exit() — keep the server alive
 });
